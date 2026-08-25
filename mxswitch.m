@@ -15,7 +15,7 @@
 //  Manual build, if not using build.sh:
 //    clang -fobjc-arc -O2 -Wall -o mxswitch mxswitch.m \
 //        -framework Foundation -framework IOKit \
-//        -framework IOBluetooth -framework CoreDisplay
+//        -framework CoreDisplay
 //
 //  NOTE: IOAVServiceCreate / IOAVServiceWriteI2C are PRIVATE symbols and live
 //  in CoreDisplay.framework, NOT IOKit — the build must link -framework
@@ -29,8 +29,11 @@
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/hid/IOHIDManager.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/IOMessage.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 
 // ---------------------------------------------------------------- config
 
@@ -46,7 +49,7 @@ static const uint32_t kDDCChipAddress  = 0x37;  // 0xB7 for MCDP29xx converters
 static const uint32_t kDDCDataAddress  = 0x51;  // 0x50 on some LG panels
 static const uint8_t  kVCPInputSource  = 0x60;  // 0xF4 on some LG panels
 static const int      kDDCIterations   = 2;     // some displays need more
-static const useconds_t kDDCWaitMicros = 10000; // some displays need 50000
+static const useconds_t kDDCWaitMicros = 50000; // some displays need 50000
 
 // Only devices whose product name contains this are counted.
 static NSString *const kProductMatch = @"MX";
@@ -56,10 +59,13 @@ static NSString *const kProductMatch = @"MX";
 static const NSTimeInterval kDrainWindow = 2.0;
 
 // Ignore the event if there has been no human input for longer than this.
-static const NSTimeInterval kIdleLimit = 300.0;
+static const NSTimeInterval kIdleLimit = INFINITY;
 
 // Refuse to fire twice in quick succession.
-static const NSTimeInterval kCooldown = 4.0;
+static const NSTimeInterval kCooldown = 5.0;
+
+// After waking, ignore device removals for this long.
+static const NSTimeInterval kWakeGuard = 5.0;
 
 // ------------------------------------------------- private API surface
 
@@ -71,7 +77,6 @@ extern IOReturn IOAVServiceWriteI2C(IOAVServiceRef service,
                                     void *inputBuffer,
                                     uint32_t inputBufferSize);
 
-extern int IOBluetoothPreferenceGetControllerPowerState(void);
 
 // ---------------------------------------------------------------- state
 
@@ -130,8 +135,45 @@ static NSTimeInterval idleSeconds(void) {
     return secs;
 }
 
-static BOOL bluetoothOn(void) {
-    return IOBluetoothPreferenceGetControllerPowerState() != 0;
+/// Sleep/wake suppression.
+///
+/// When the Mac sleeps, the MX devices disconnect — and those removals look
+/// exactly like an Easy-Switch press: simultaneous, and with a low idle time
+/// if you were typing right up to closing the lid. So we track power state
+/// and refuse to switch while asleep, or for a short window after waking
+/// (removals queued during the sleep transition can arrive post-wake).
+static io_connect_t gRootPort;
+static BOOL gSleeping;
+static NSTimeInterval gWakeGuardUntil;   // monotonic; 0 = no guard
+
+static void powerCallback(void *refcon, io_service_t service,
+                          natural_t messageType, void *messageArgument) {
+    switch (messageType) {
+
+        case kIOMessageCanSystemSleep:
+            // Idle sleep is being proposed. We never veto — and we MUST
+            // answer, or the system waits out a 30-second timeout before
+            // sleeping every single time.
+            IOAllowPowerChange(gRootPort, (long)messageArgument);
+            break;
+
+        case kIOMessageSystemWillSleep:
+            gSleeping = YES;
+            mxlog(@"system sleeping; switching suppressed");
+            // Mandatory acknowledgement, same reasoning as above.
+            IOAllowPowerChange(gRootPort, (long)messageArgument);
+            break;
+
+        case kIOMessageSystemHasPoweredOn:
+            gSleeping = NO;
+            gWakeGuardUntil = nowSecs() + kWakeGuard;
+            gDrainStart = 0;
+            mxlog(@"system awake; switching suppressed for %.0fs", kWakeGuard);
+            break;
+
+        default:
+            break;
+    }
 }
 
 /// Write VCP feature 0x60 (input source) over DDC/CI.
@@ -212,13 +254,16 @@ static void considerSwitch(void) {
         return;
     }
 
-    mxlog(@"  checking Bluetooth...");
-    if (!bluetoothOn()) {
-        mxlog(@"ignoring: Bluetooth is off");
+    if (gSleeping) {
+        mxlog(@"ignoring: system is sleeping");
         return;
     }
 
-    mxlog(@"  checking idle time...");
+    if (gWakeGuardUntil && now < gWakeGuardUntil) {
+        mxlog(@"ignoring: within %.0fs of wake", kWakeGuard);
+        return;
+    }
+
     NSTimeInterval idle = idleSeconds();
     if (idle < 0) {
         mxlog(@"warning: could not read HIDIdleTime; proceeding");
@@ -296,6 +341,20 @@ int main(int argc, const char *argv[]) {
 
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(),
                                         kCFRunLoopDefaultMode);
+
+        // Sleep/wake notifications. Public API, no TCC prompt.
+        IONotificationPortRef pmPort = NULL;
+        io_object_t pmNotifier = 0;
+        gRootPort = IORegisterForSystemPower(NULL, &pmPort,
+                                             powerCallback, &pmNotifier);
+        if (gRootPort == MACH_PORT_NULL) {
+            mxlog(@"warning: IORegisterForSystemPower failed; "
+                   "sleep suppression disabled");
+        } else {
+            CFRunLoopAddSource(CFRunLoopGetMain(),
+                               IONotificationPortGetRunLoopSource(pmPort),
+                               kCFRunLoopDefaultMode);
+        }
 
         // Deliberately NOT calling IOHIDManagerOpen(). Opening the manager
         // requires Input Monitoring (TCC) and would prompt the user — but we
