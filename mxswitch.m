@@ -30,6 +30,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/hid/IOHIDManager.h>
 #include <unistd.h>
+#include <time.h>
 
 // ---------------------------------------------------------------- config
 
@@ -55,10 +56,10 @@ static NSString *const kProductMatch = @"MX";
 static const NSTimeInterval kDrainWindow = 2.0;
 
 // Ignore the event if there has been no human input for longer than this.
-static const NSTimeInterval kIdleLimit = 120.0;
+static const NSTimeInterval kIdleLimit = 300.0;
 
 // Refuse to fire twice in quick succession.
-static const NSTimeInterval kCooldown = 10.0;
+static const NSTimeInterval kCooldown = 4.0;
 
 // ------------------------------------------------- private API surface
 
@@ -75,8 +76,8 @@ extern int IOBluetoothPreferenceGetControllerPowerState(void);
 // ---------------------------------------------------------------- state
 
 static NSMutableSet<NSString *> *gAttached;   // product names currently present
-static NSDate *gDrainStart;                   // when the current drain began
-static NSDate *gLastFire;
+static NSTimeInterval gDrainStart;            // monotonic; 0 = not draining
+static NSTimeInterval gLastFire;              // monotonic; 0 = never fired
 
 // ---------------------------------------------------------------- utils
 
@@ -92,6 +93,18 @@ static void mxlog(NSString *fmt, ...) {
             [[df stringFromDate:[NSDate date]] UTF8String],
             [msg UTF8String]);
     fflush(stdout);
+}
+
+/// Seconds from an arbitrary fixed origin, monotonic and immune to NTP steps
+/// or manual clock changes.
+///
+/// CLOCK_MONOTONIC_RAW keeps counting while the system is asleep, which is
+/// what we want: if the Mac sleeps between one device leaving and the next,
+/// that really was a long gap and should not read as a simultaneous drain.
+/// CLOCK_UPTIME_RAW (and mach_absolute_time) pause during sleep and would
+/// make an overnight gap look instantaneous — do not substitute them here.
+static NSTimeInterval nowSecs(void) {
+    return (NSTimeInterval)clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1e9;
 }
 
 /// Seconds since the last HID event from any device on this Mac.
@@ -153,15 +166,28 @@ static void setDisplayInput(uint8_t value) {
             ^ data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4];
 
     IOReturn err = kIOReturnSuccess;
+    IOReturn firstErr = kIOReturnError;
     for (int i = 0; i < kDDCIterations; i++) {
         usleep(kDDCWaitMicros);
         err = IOAVServiceWriteI2C(svc, kDDCChipAddress, kDDCDataAddress,
                                   data, sizeof(data));
+        if (i == 0) firstErr = err;
         if (err != kIOReturnSuccess) break;
     }
 
-    if (err == kIOReturnSuccess) mxlog(@"DDC: set input to %u (0x%02X)", value, value);
-    else                         mxlog(@"DDC: write failed (0x%08X)", err);
+    // Switching input tears down the DisplayPort link on this Mac, which
+    // invalidates the AVService's mach port. So the repeat write typically
+    // comes back MACH_SEND_INVALID_DEST (0x10000003) even though the switch
+    // worked. Only the first write's result tells us anything.
+    if (firstErr == kIOReturnSuccess) {
+        mxlog(@"DDC: set input to %u (0x%02X)", value, value);
+        if (err != kIOReturnSuccess) {
+            mxlog(@"  (repeat write returned 0x%08X — expected on input switch)",
+                  err);
+        }
+    } else {
+        mxlog(@"DDC: write failed (0x%08X)", firstErr);
+    }
 
     CFRelease(svc);
 }
@@ -171,25 +197,28 @@ static void setDisplayInput(uint8_t value) {
 static void considerSwitch(void) {
     if (gAttached.count > 0) return;          // something is still here
 
-    NSDate *now = [NSDate date];
+    mxlog(@"considering switch...");
+    NSTimeInterval now = nowSecs();
 
-    NSTimeInterval drain = gDrainStart ? [now timeIntervalSinceDate:gDrainStart] : 0;
+    NSTimeInterval drain = gDrainStart ? (now - gDrainStart) : 0;
     if (drain > kDrainWindow) {
         mxlog(@"ignoring: devices drained over %.1fs (> %.1fs window)",
              drain, kDrainWindow);
         return;
     }
 
-    if (gLastFire && [now timeIntervalSinceDate:gLastFire] < kCooldown) {
+    if (gLastFire && (now - gLastFire) < kCooldown) {
         mxlog(@"ignoring: within cooldown");
         return;
     }
 
+    mxlog(@"  checking Bluetooth...");
     if (!bluetoothOn()) {
         mxlog(@"ignoring: Bluetooth is off");
         return;
     }
 
+    mxlog(@"  checking idle time...");
     NSTimeInterval idle = idleSeconds();
     if (idle < 0) {
         mxlog(@"warning: could not read HIDIdleTime; proceeding");
@@ -198,6 +227,7 @@ static void considerSwitch(void) {
         return;
     }
 
+    mxlog(@"  writing DDC...");
     gLastFire = now;
     setDisplayInput(kTargetInput);
 }
@@ -222,7 +252,7 @@ static void deviceAdded(void *ctx, IOReturn result,
         [gAttached addObject:name];
         mxlog(@"attached: %@ (now %lu)", name, (unsigned long)gAttached.count);
     }
-    gDrainStart = nil;
+    gDrainStart = 0;
 }
 
 static void deviceRemoved(void *ctx, IOReturn result,
@@ -231,25 +261,15 @@ static void deviceRemoved(void *ctx, IOReturn result,
     if (!name || ![name containsString:kProductMatch]) return;
 
     if ([gAttached containsObject:name]) {
-        if (gAttached.count == 1 || gDrainStart == nil) {
-            if (gDrainStart == nil) gDrainStart = [NSDate date];
-        }
+        if (gDrainStart == 0) gDrainStart = nowSecs();
         [gAttached removeObject:name];
         mxlog(@"removed: %@ (now %lu)", name, (unsigned long)gAttached.count);
     }
 
-    // Debounce: give any sibling device a moment to leave too, then decide.
-    static dispatch_source_t timer;
-    if (timer) dispatch_source_cancel(timer);
-    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                   dispatch_get_main_queue());
-    dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
-                              DISPATCH_TIME_FOREVER, 50 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(timer, ^{
-        considerSwitch();
-    });
-    dispatch_resume(timer);
+    // No debounce needed: we only act once the set is empty, so the final
+    // removal is itself the trigger. The drain window below decides whether
+    // the devices left together (Easy-Switch) or drifted off independently.
+    if (gAttached.count == 0) considerSwitch();
 }
 
 // ---------------------------------------------------------------- main
@@ -277,14 +297,19 @@ int main(int argc, const char *argv[]) {
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(),
                                         kCFRunLoopDefaultMode);
 
-        IOReturn kr = IOHIDManagerOpen(mgr, kIOHIDOptionsTypeNone);
-        if (kr != kIOReturnSuccess) {
-            // Opening for enumeration only does not need Input Monitoring,
-            // but a restrictive MDM profile can still refuse.
-            mxlog(@"warning: IOHIDManagerOpen returned 0x%08X", kr);
-        }
+        // Deliberately NOT calling IOHIDManagerOpen(). Opening the manager
+        // requires Input Monitoring (TCC) and would prompt the user — but we
+        // only need to know when devices appear and disappear, and the
+        // matching/removal callbacks fire on the scheduled run loop without
+        // an open. Keeping it closed means no permission prompt, no grant to
+        // re-approve after every rebuild, and nothing for MDM to refuse.
+        //
+        // If a future macOS stops delivering callbacks without an open, the
+        // TCC-free fallback is IOServiceAddMatchingNotification on
+        // IOHIDDevice via plain IOKit rather than the HID manager.
 
-        mxlog(@"mxswitch started; target input 0x%02X", kTargetInput);
+        mxlog(@"mxswitch started; target input %u (0x%02X)",
+              kTargetInput, kTargetInput);
         CFRunLoopRun();
     }
     return 0;
