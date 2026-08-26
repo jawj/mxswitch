@@ -26,7 +26,6 @@ echo "Compiling $SRC ..."
 clang -fobjc-arc -O2 -Wall -o "/tmp/$NAME.$$" "$SRC" \
     -framework Foundation \
     -framework IOKit \
-    -framework IOBluetooth \
     -framework CoreDisplay
 
 # --------------------------------------------------------------- bundle

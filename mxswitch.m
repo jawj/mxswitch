@@ -7,15 +7,10 @@
 //  Event-driven: no polling. IOHIDManager calls us on device attach/remove.
 //
 //  Build and install (compiles, bundles, signs, loads the LaunchAgent):
-//    ./build.sh 16       # personal Mac, hands monitor to input 16
-//    ./build.sh 15       # work Mac, hands monitor to input 15
+//    ./build.sh 16       # e.g. personal Mac, hands monitor to input 16 (DisplayPort #2)
+//    ./build.sh 15       # e.g. work Mac, hands monitor to input 15 (DisplayPort #1)
 //
 //  Bundle / LaunchAgent identifier: com.mackerron.mxswitch
-//
-//  Manual build, if not using build.sh:
-//    clang -fobjc-arc -O2 -Wall -o mxswitch mxswitch.m \
-//        -framework Foundation -framework IOKit \
-//        -framework CoreDisplay
 //
 //  NOTE: IOAVServiceCreate / IOAVServiceWriteI2C are PRIVATE symbols and live
 //  in CoreDisplay.framework, NOT IOKit — the build must link -framework
